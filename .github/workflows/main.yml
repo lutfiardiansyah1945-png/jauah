@@ -1,0 +1,1211 @@
+name: Build ZenithOptimizer APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate project
+        run: |
+          mkdir -p zo/app/src/main/java/com/lutfikreji/zenithoptimizer
+          cd zo
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ZenithOptimizer"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.lutfikreji.zenithoptimizer"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.lutfikreji.zenithoptimizer"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <application
+                  android:label="ZenithOptimizer"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                  android:requestLegacyExternalStorage="true">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="orientation|screenSize|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".BoostJob" android:exported="false"
+                      android:permission="android.permission.BIND_JOB_SERVICE" />
+                  <provider android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:multiprocess="false" android:enabled="true" android:exported="true"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/lutfikreji/zenithoptimizer/MainActivity.kt <<'EOF'
+          package com.lutfikreji.zenithoptimizer
+
+          import android.app.ActivityManager
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.job.JobInfo
+          import android.app.job.JobParameters
+          import android.app.job.JobScheduler
+          import android.app.job.JobService
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.SharedPreferences
+          import android.content.pm.ApplicationInfo
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.Editable
+          import android.text.InputType
+          import android.text.TextWatcher
+          import android.util.DisplayMetrics
+          import android.util.LruCache
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.*
+          import rikka.shizuku.Shizuku
+          import java.io.File
+          import java.util.concurrent.Executors
+
+          const val BOOST = "cmd activity kill-all; sync; echo 3 > /proc/sys/vm/drop_caches"
+
+          object Sh {
+              var root = false
+              fun shizuku(): Boolean = try {
+                  Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              } catch (e: Throwable) { false }
+              fun checkRoot(): Boolean {
+                  root = try { Runtime.getRuntime().exec(arrayOf("su", "-c", "id")).waitFor() == 0 } catch (e: Throwable) { false }
+                  return root
+              }
+              val ok: Boolean get() = root || shizuku()
+              fun run(cmd: String): String = try {
+                  val p: java.lang.Process = if (root) Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+                  else if (shizuku()) {
+                      val m = Shizuku::class.java.getDeclaredMethod("newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java)
+                      m.isAccessible = true
+                      m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as java.lang.Process
+                  } else Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
+                  val o = p.inputStream.bufferedReader().readText() + p.errorStream.bufferedReader().readText()
+                  p.waitFor()
+                  o.trim()
+              } catch (e: Throwable) { "ERR: " + e.message }
+          }
+
+          class BoostJob : JobService() {
+              override fun onStartJob(p: JobParameters?): Boolean {
+                  Thread { Sh.checkRoot(); Sh.run(BOOST); jobFinished(p, false) }.start()
+                  return true
+              }
+              override fun onStopJob(p: JobParameters?) = false
+          }
+
+          class Ico(ctx: android.content.Context, val k: String, var col: Int) : View(ctx) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE; strokeWidth = 2f; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+              }
+              fun tint(x: Int) { col = x; invalidate() }
+              override fun onDraw(cv: Canvas) {
+                  val s = minOf(width, height) / 24f
+                  cv.scale(s, s)
+                  p.color = col; p.style = Paint.Style.STROKE
+                  fun poly(vararg f: Float) {
+                      val q = Path(); q.moveTo(f[0], f[1])
+                      var i = 2
+                      while (i < f.size) { q.lineTo(f[i], f[i + 1]); i += 2 }
+                      cv.drawPath(q, p)
+                  }
+                  fun solid(vararg f: Float) {
+                      val q = Path(); q.moveTo(f[0], f[1])
+                      var i = 2
+                      while (i < f.size) { q.lineTo(f[i], f[i + 1]); i += 2 }
+                      q.close(); p.style = Paint.Style.FILL_AND_STROKE; cv.drawPath(q, p); p.style = Paint.Style.STROKE
+                  }
+                  fun ln(a: Float, b: Float, x: Float, y: Float) = cv.drawLine(a, b, x, y, p)
+                  fun rr(a: Float, b: Float, x: Float, y: Float, r: Float) = cv.drawRoundRect(RectF(a, b, x, y), r, r, p)
+                  fun ring(x: Float, y: Float, r: Float) = cv.drawCircle(x, y, r, p)
+                  fun dot(x: Float, y: Float, r: Float) { p.style = Paint.Style.FILL; cv.drawCircle(x, y, r, p); p.style = Paint.Style.STROKE }
+                  when (k) {
+                      "home" -> { poly(3f, 11f, 12f, 3f, 21f, 11f); poly(5f, 9.5f, 5f, 20f, 19f, 20f, 19f, 9.5f); poly(10f, 20f, 10f, 14f, 14f, 14f, 14f, 20f) }
+                      "apps" -> { rr(3f, 3f, 10.5f, 10.5f, 2.5f); rr(13.5f, 3f, 21f, 10.5f, 2.5f); rr(3f, 13.5f, 10.5f, 21f, 2.5f); rr(13.5f, 13.5f, 21f, 21f, 2.5f) }
+                      "tune" -> for ((x, y) in listOf(6f to 12f, 12f to 7f, 18f to 15f)) { ln(x, 4f, x, y - 3.5f); ln(x, y + 3.5f, x, 20f); ring(x, y, 2.5f) }
+                      "gear" -> {
+                          ring(12f, 12f, 3f); ring(12f, 12f, 7f)
+                          for (i in 0..7) {
+                              val a = Math.toRadians(i * 45.0); val cx = Math.cos(a).toFloat(); val sy = Math.sin(a).toFloat()
+                              ln(12f + 7f * cx, 12f + 7f * sy, 12f + 10f * cx, 12f + 10f * sy)
+                          }
+                      }
+                      "sun" -> {
+                          ring(12f, 12f, 4f)
+                          for (i in 0..7) {
+                              val a = Math.toRadians(i * 45.0); val cx = Math.cos(a).toFloat(); val sy = Math.sin(a).toFloat()
+                              ln(12f + 6.8f * cx, 12f + 6.8f * sy, 12f + 9.5f * cx, 12f + 9.5f * sy)
+                          }
+                      }
+                      "power" -> { cv.drawArc(RectF(5f, 5f, 19f, 19f), -60f, 300f, false, p); ln(12f, 3f, 12f, 12f) }
+                      "bolt" -> solid(13f, 2.5f, 5f, 13.5f, 11f, 13.5f, 10f, 21.5f, 19f, 10f, 13f, 10f)
+                      "battery" -> { rr(2f, 7f, 19.5f, 17f, 2.5f); ln(22f, 10.5f, 22f, 13.5f); p.style = Paint.Style.FILL; cv.drawRoundRect(RectF(4.5f, 9.5f, 12f, 14.5f), 1f, 1f, p) }
+                      "gauge" -> { cv.drawArc(RectF(3f, 5f, 21f, 23f), 180f, 180f, false, p); ln(12f, 14f, 16.5f, 9.5f); dot(12f, 14f, 1.6f) }
+                      "check" -> poly(5f, 12.5f, 10f, 17.5f, 19f, 7f)
+                      "cross" -> { ln(6f, 6f, 18f, 18f); ln(18f, 6f, 6f, 18f) }
+                      "info" -> { ring(12f, 12f, 9f); ln(12f, 11f, 12f, 17f); dot(12f, 7.6f, 1.2f) }
+                      "back" -> { ln(19f, 12f, 5f, 12f); poly(11f, 6f, 5f, 12f, 11f, 18f) }
+                      "chev" -> poly(9f, 5f, 16f, 12f, 9f, 19f)
+                      "trash" -> { ln(4f, 7f, 20f, 7f); poly(9f, 7f, 9f, 4f, 15f, 4f, 15f, 7f); poly(6f, 7f, 7f, 20f, 17f, 20f, 18f, 7f); ln(10f, 11f, 10f, 16f); ln(14f, 11f, 14f, 16f) }
+                      "pad" -> { rr(2f, 6.5f, 22f, 17.5f, 5.5f); ln(6f, 12f, 10f, 12f); ln(8f, 10f, 8f, 14f); dot(15.5f, 10.8f, 1.3f); dot(18f, 13.2f, 1.3f) }
+                      "scale" -> { rr(3f, 3f, 21f, 21f, 3f); rr(3f, 10f, 14f, 21f, 2.5f) }
+                      "clock" -> { ring(12f, 12f, 9f); poly(12f, 7f, 12f, 12f, 15.5f, 14f) }
+                      "dnd" -> { ring(12f, 12f, 9f); ln(8f, 12f, 16f, 12f) }
+                      "play" -> solid(8f, 5f, 19f, 12f, 8f, 19f)
+                      "screen" -> { rr(3f, 4f, 21f, 16f, 2.5f); ln(8f, 20f, 16f, 20f); ln(12f, 16f, 12f, 20f) }
+                      "globe" -> { ring(12f, 12f, 9f); ln(3f, 12f, 21f, 12f); cv.drawOval(RectF(8f, 3f, 16f, 21f), p) }
+                      "share" -> { ring(18f, 5f, 3f); ring(6f, 12f, 3f); ring(18f, 19f, 3f); ln(8.7f, 10.6f, 15.3f, 6.4f); ln(8.7f, 13.4f, 15.3f, 17.6f) }
+                      "undo" -> {
+                          poly(9f, 4f, 4f, 9f, 9f, 14f)
+                          val q = Path(); q.moveTo(4f, 9f); q.lineTo(14f, 9f); q.quadTo(20f, 9f, 20f, 14f); q.quadTo(20f, 19f, 14f, 19f); q.lineTo(8f, 19f)
+                          cv.drawPath(q, p)
+                      }
+                      "wave" -> {
+                          val q = Path(); q.moveTo(2f, 12f); q.quadTo(6f, 3f, 10f, 12f); q.quadTo(14f, 21f, 18f, 12f); q.lineTo(22f, 12f)
+                          cv.drawPath(q, p)
+                      }
+                      "lock" -> { rr(5f, 11f, 19f, 21f, 3f); cv.drawArc(RectF(8f, 4f, 16f, 12f), 180f, 180f, false, p); ln(8f, 8f, 8f, 11f); ln(16f, 8f, 16f, 11f); dot(12f, 16f, 1.4f) }
+                      else -> {}
+                  }
+              }
+          }
+
+          class Spin(ctx: android.content.Context) : View(ctx) {
+              var mode = 0
+              var col = 0
+              var okC = 0
+              var errC = 0
+              private var ang = 0f
+              private var prog = 0f
+              private var spin: android.animation.ValueAnimator? = null
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+              fun start() {
+                  mode = 0; spin?.cancel()
+                  spin = android.animation.ValueAnimator.ofFloat(0f, 360f).apply {
+                      duration = 900; repeatCount = android.animation.ValueAnimator.INFINITE
+                      interpolator = android.view.animation.LinearInterpolator()
+                      addUpdateListener { ang = it.animatedValue as Float; invalidate() }
+                      start()
+                  }
+              }
+              fun finish(ok: Boolean) {
+                  spin?.cancel(); mode = if (ok) 1 else 2; prog = 0f
+                  android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+                      duration = 450; interpolator = android.view.animation.DecelerateInterpolator()
+                      addUpdateListener { prog = it.animatedValue as Float; invalidate() }
+                      start()
+                  }
+              }
+              override fun onDetachedFromWindow() { spin?.cancel(); super.onDetachedFromWindow() }
+              private fun poly(cv: Canvas, pr: Float, vararg f: Float) {
+                  var tot = 0f
+                  var i = 0
+                  while (i < f.size - 2) { tot += Math.hypot((f[i + 2] - f[i]).toDouble(), (f[i + 3] - f[i + 1]).toDouble()).toFloat(); i += 2 }
+                  var rem = tot * pr
+                  i = 0
+                  while (i < f.size - 2 && rem > 0f) {
+                      val len = Math.hypot((f[i + 2] - f[i]).toDouble(), (f[i + 3] - f[i + 1]).toDouble()).toFloat()
+                      val k = minOf(1f, rem / len)
+                      cv.drawLine(f[i], f[i + 1], f[i] + (f[i + 2] - f[i]) * k, f[i + 1] + (f[i + 3] - f[i + 1]) * k, p)
+                      rem -= len; i += 2
+                  }
+              }
+              override fun onDraw(cv: Canvas) {
+                  val s = minOf(width, height).toFloat()
+                  p.strokeWidth = s / 12f
+                  val r = RectF(s * .12f, s * .12f, s * .88f, s * .88f)
+                  if (mode == 0) {
+                      p.color = (0x33 shl 24) or (col and 0xFFFFFF); cv.drawArc(r, 0f, 360f, false, p)
+                      p.color = col; cv.drawArc(r, ang, 110f, false, p)
+                  } else {
+                      p.color = if (mode == 1) okC else errC
+                      cv.drawArc(r, -90f, 360f * prog, false, p)
+                      if (mode == 1) poly(cv, prog, s * .3f, s * .52f, s * .44f, s * .66f, s * .71f, s * .36f)
+                      else { poly(cv, prog, s * .36f, s * .36f, s * .64f, s * .64f); poly(cv, prog, s * .64f, s * .36f, s * .36f, s * .64f) }
+                  }
+              }
+          }
+
+          class Pal(val bg: Int, val card: Int, val inner: Int, val txt: Int, val sub: Int, val acc: Int, val onAcc: Int)
+          fun c(s: String) = Color.parseColor(s)
+          val DK by lazy { Pal(c("#0B0D12"), c("#14171D"), c("#1D212A"), c("#FFFFFF"), c("#9AA0AA"), c("#C3C9FA"), c("#1B2250")) }
+          val LT by lazy { Pal(c("#F4F5FA"), c("#FFFFFF"), c("#E8EBF4"), c("#101318"), c("#5C6370"), c("#3F51B5"), c("#FFFFFF")) }
+          data class AppI(val label: String, val pkg: String, val game: Boolean)
+
+          class MainActivity : Activity() {
+              lateinit var sp: SharedPreferences
+              lateinit var host: FrameLayout
+              lateinit var nav: LinearLayout
+              lateinit var P: Pal
+              var tab = 0
+              var sub = ""
+              var lang = "id"
+              var pw = 0; var ph = 0; var pd = 0
+              val ex = Executors.newSingleThreadExecutor()
+              val ui = Handler(Looper.getMainLooper())
+              val icons = LruCache<String, Drawable>(300)
+              var dlg: AlertDialog? = null
+              lateinit var rootL: FrameLayout
+              var checking = true
+              var gateShown = false
+              var polling = false
+              var angle = 0
+              var angleInfo = ""
+              var angleBusy = false
+              var swX = 0f
+              var swY = 0f
+              var noSwipe = false
+              var swiping = false
+              var ov: FrameLayout? = null
+              var ovSpin: Spin? = null
+              var ovTxt: TextView? = null
+              val navI = ArrayList<Triple<LinearLayout, Ico, TextView>>()
+              val navKeys = listOf("home" to "Beranda|Home", "apps" to "Aplikasi|Apps", "tune" to "Fitur|Features", "gear" to "Pengaturan|Settings")
+
+              fun t(s: String): String { val a = s.split("|"); return if (lang == "en") a[1] else a[0] }
+              fun dark(): Boolean = when (sp.getString("theme", "system")) {
+                  "dark" -> true
+                  "light" -> false
+                  else -> (resources.configuration.uiMode and 0x30) == 0x20
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  sp = getSharedPreferences("p", MODE_PRIVATE)
+                  lang = sp.getString("lang", "id")!!
+                  tab = sp.getInt("rt", 0); sp.edit().putInt("rt", 0).apply()
+                  P = if (dark()) DK else LT
+                  window.statusBarColor = P.bg
+                  window.navigationBarColor = P.bg
+                  if (!dark()) window.decorView.systemUiVisibility = 0x2010
+                  val root = FrameLayout(this).apply { setBackgroundColor(P.bg) }
+                  rootL = root
+                  host = FrameLayout(this)
+                  root.addView(host, FrameLayout.LayoutParams(-1, -1))
+                  nav = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      background = bg(P.inner, 40)
+                      setPadding(dp(8), dp(8), dp(8), dp(8))
+                      elevation = dp(8).toFloat()
+                      layoutTransition = android.animation.LayoutTransition().apply { enableTransitionType(android.animation.LayoutTransition.CHANGING) }
+                  }
+                  root.addView(nav, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(26) })
+                  setContentView(root)
+                  buildNav()
+                  ex.execute { Sh.checkRoot(); checking = false; ui.post { if (gateShown || (tab == 0 && sub == "")) show() } }
+                  show()
+              }
+
+              override fun onResume() { super.onResume(); if (::host.isInitialized && (!Sh.ok || (tab == 0 && sub == ""))) show() }
+              override fun onBackPressed() { if (sub != "") { sub = ""; show(-1) } else super.onBackPressed() }
+
+              fun hit(v: View, x: Int, y: Int): Boolean {
+                  if (v.visibility != View.VISIBLE) return false
+                  val r = android.graphics.Rect()
+                  if (!v.getGlobalVisibleRect(r) || !r.contains(x, y)) return false
+                  if (v is SeekBar || v is HorizontalScrollView || v is EditText) return true
+                  if (v is ViewGroup) for (i in 0 until v.childCount) if (hit(v.getChildAt(i), x, y)) return true
+                  return false
+              }
+
+              override fun dispatchTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          swX = e.rawX; swY = e.rawY; swiping = false
+                          noSwipe = ov != null || gateShown || sub != "" || hit(window.decorView, e.rawX.toInt(), e.rawY.toInt())
+                      }
+                      MotionEvent.ACTION_MOVE -> if (!noSwipe && !swiping) {
+                          val dx = e.rawX - swX; val dy = e.rawY - swY
+                          if (Math.abs(dx) > dp(24) && Math.abs(dx) > Math.abs(dy) * 2) {
+                              swiping = true
+                              val cn = MotionEvent.obtain(e); cn.action = MotionEvent.ACTION_CANCEL
+                              super.dispatchTouchEvent(cn); cn.recycle()
+                          }
+                      }
+                      MotionEvent.ACTION_UP -> if (swiping) {
+                          swiping = false
+                          val dx = e.rawX - swX
+                          if (Math.abs(dx) > dp(90)) go(if (dx < 0) tab + 1 else tab - 1)
+                          return true
+                      }
+                      MotionEvent.ACTION_CANCEL -> swiping = false
+                  }
+                  if (swiping) return true
+                  return super.dispatchTouchEvent(e)
+              }
+
+              override fun onActivityResult(rc: Int, res: Int, d: Intent?) {
+                  super.onActivityResult(rc, res, d)
+                  if (rc != 7 || res != RESULT_OK) return
+                  val u = d?.data ?: return
+                  try {
+                      val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                      contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, o) }
+                      o.inSampleSize = maxOf(1, o.outWidth / 1200); o.inJustDecodeBounds = false
+                      val bm = contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, o) }
+                      File(filesDir, "banner.jpg").outputStream().use { bm!!.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+                      show()
+                  } catch (e: Exception) { toast("Error: " + e.message) }
+              }
+
+              // ---------- helpers ----------
+              fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              fun bg(col: Int, r: Int = 20) = GradientDrawable().apply { setColor(col); cornerRadius = dp(r).toFloat() }
+              fun tv(s: String, sz: Float = 14f, col: Int = P.txt, b: Boolean = false) = TextView(this).apply {
+                  text = s; textSize = sz; setTextColor(col); if (b) setTypeface(null, Typeface.BOLD)
+              }
+              fun lp(w: Int = -1, h: Int = -2, wt: Float = 0f, m: Int = 0) =
+                  LinearLayout.LayoutParams(w, h, wt).apply { setMargins(dp(m), dp(m), dp(m), dp(m)) }
+              fun vbox(col: Int = P.card, pad: Int = 16, r: Int = 24) = LinearLayout(this).apply {
+                  orientation = LinearLayout.VERTICAL; background = bg(col, r); setPadding(dp(pad), dp(pad), dp(pad), dp(pad))
+              }
+              fun hbox() = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+              fun btn(s: String, sel: Boolean = false, f: () -> Unit) = TextView(this).apply {
+                  text = s; gravity = Gravity.CENTER; textSize = 13f
+                  setPadding(dp(14), dp(10), dp(14), dp(10))
+                  setTextColor(if (sel) P.onAcc else P.txt)
+                  background = bg(if (sel) P.acc else P.inner, 50)
+                  setOnClickListener { f() }
+              }
+              fun sec(s: String) = tv(s, 13f, P.acc, true)
+              fun chip(s: String, fg: Int) = tv(s, 11f, fg, true).apply {
+                  setPadding(dp(10), dp(3), dp(10), dp(3)); background = bg((0x33 shl 24) or (fg and 0xFFFFFF), 50)
+              }
+              fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+              fun scroll(b: LinearLayout.() -> Unit): View {
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(48), dp(16), dp(120)) }
+                  col.b()
+                  return ScrollView(this).apply { addView(col) }
+              }
+              fun LinearLayout.put(v: View) { addView(v, lp().apply { topMargin = dp(12) }) }
+              fun tint(col: Int, a: Int = 0x26) = (a shl 24) or (col and 0xFFFFFF)
+              fun badge(k: String, bgc: Int, fg: Int, size: Int = 40, ic: Int = 20): View = FrameLayout(this).apply {
+                  background = bg(bgc, 14)
+                  addView(Ico(this@MainActivity, k, fg), FrameLayout.LayoutParams(dp(ic), dp(ic), Gravity.CENTER))
+              }
+              fun cardI(ic: String, title: String, vararg v: View): View = vbox(P.card, 14, 24).apply {
+                  val h = hbox()
+                  if (ic != "") h.addView(badge(ic, tint(P.acc), P.acc, 34, 18), lp(dp(34), dp(34)).apply { rightMargin = dp(12) })
+                  h.addView(tv(title, 15f, P.txt, true))
+                  addView(h)
+                  v.forEach { addView(it, lp().apply { topMargin = dp(12) }) }
+              }
+              fun card(title: String, vararg v: View): View = cardI("", title, *v)
+              fun actRow(ic: String, title: String, s2: String, hi: Boolean = false, f: () -> Unit): View = hbox().apply {
+                  background = bg(if (hi) P.acc else P.inner, 18)
+                  setPadding(dp(12), dp(12), dp(14), dp(12))
+                  val fg = if (hi) P.onAcc else P.txt
+                  addView(badge(ic, tint(if (hi) P.onAcc else P.acc, 0x2E), if (hi) P.onAcc else P.acc), lp(dp(40), dp(40)))
+                  val tx = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                  tx.addView(tv(title, 14f, fg, true)); tx.addView(tv(s2, 12f, if (hi) fg else P.sub))
+                  addView(tx, lp(0, -2, 1f).apply { leftMargin = dp(12) })
+                  addView(Ico(this@MainActivity, "chev", if (hi) P.onAcc else P.sub), lp(dp(18), dp(18)))
+                  setOnClickListener { f() }
+              }
+              fun swCard(ic: String, title: String, s2: String, on: Boolean, f: (Boolean) -> Unit): View = hbox().apply {
+                  background = bg(P.inner, 18)
+                  setPadding(dp(12), dp(12), dp(14), dp(12))
+                  addView(badge(ic, tint(P.acc, 0x2E), P.acc), lp(dp(40), dp(40)))
+                  val tx = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                  tx.addView(tv(title, 14f, P.txt, true)); tx.addView(tv(s2, 12f, P.sub))
+                  addView(tx, lp(0, -2, 1f).apply { leftMargin = dp(12) })
+                  addView(Switch(this@MainActivity).apply { isChecked = on; setOnCheckedChangeListener { _, v -> f(v) } })
+              }
+              fun toggleTile(ic: String, label: String, key: String, f: (Boolean, (Boolean) -> Unit) -> Unit): View {
+                  var on = sp.getBoolean(key, false)
+                  val box = vbox(P.inner, 14, 20)
+                  val icv = Ico(this, ic, P.acc)
+                  val bd = FrameLayout(this).apply { addView(icv, FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER)) }
+                  val st = tv("", 12f, P.sub, true)
+                  val lb = tv(label, 14f, P.txt, true)
+                  val top = hbox()
+                  top.addView(bd, lp(dp(40), dp(40)))
+                  top.addView(View(this), lp(0, 1, 1f))
+                  top.addView(st)
+                  box.addView(top)
+                  box.addView(lb, lp().apply { topMargin = dp(12) })
+                  fun paint() {
+                      box.background = bg(if (on) P.acc else P.inner, 20)
+                      bd.background = bg(if (on) tint(P.onAcc, 0x33) else tint(P.acc), 14)
+                      icv.tint(if (on) P.onAcc else P.acc)
+                      lb.setTextColor(if (on) P.onAcc else P.txt)
+                      st.text = if (on) t("AKTIF|ON") else t("MATI|OFF")
+                      st.setTextColor(if (on) P.onAcc else P.sub)
+                  }
+                  paint()
+                  box.setOnClickListener {
+                      if (!Sh.ok) { noAcc(); return@setOnClickListener }
+                      val nv = !on
+                      f(nv) { ok -> if (ok) { on = nv; sp.edit().putBoolean(key, on).apply(); paint() } }
+                  }
+                  return box
+              }
+              fun gradTile(ic: String, title: String, s2: String, c1: String, c2: String, go: () -> Unit): View = FrameLayout(this).apply {
+                  background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(c(c1), c(c2))).apply { cornerRadius = dp(28).toFloat() }
+                  elevation = dp(6).toFloat()
+                  setPadding(dp(16), dp(16), dp(16), dp(16))
+                  val col = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                  col.addView(badge(ic, 0x33FFFFFF, Color.WHITE, 46, 24), lp(dp(46), dp(46)))
+                  col.addView(tv(title, 17f, Color.WHITE, true), lp().apply { topMargin = dp(26) })
+                  col.addView(tv(s2, 12f, 0xCCFFFFFF.toInt()), lp().apply { topMargin = dp(2) })
+                  addView(col, FrameLayout.LayoutParams(-1, -2))
+                  addView(badge("chev", 0x33FFFFFF, Color.WHITE, 30, 16), FrameLayout.LayoutParams(dp(30), dp(30), Gravity.TOP or Gravity.END))
+                  setOnClickListener { go() }
+              }
+              fun hs(vararg v: View): View = HorizontalScrollView(this).apply {
+                  isHorizontalScrollBarEnabled = false
+                  addView(LinearLayout(this@MainActivity).apply { v.forEach { addView(it, lp(-2, -2).apply { rightMargin = dp(8) }) } })
+              }
+              fun swRow(label: String, on: Boolean, f: (Boolean) -> Unit): View = hbox().apply {
+                  addView(tv(label), lp(0, -2, 1f))
+                  addView(Switch(this@MainActivity).apply { isChecked = on; setOnCheckedChangeListener { _, v -> f(v) } })
+              }
+              fun edit(h: String) = EditText(this).apply {
+                  hint = h; setHintTextColor(P.sub); setTextColor(P.txt); background = bg(P.inner, 14)
+                  setPadding(dp(14), dp(10), dp(14), dp(10)); isSingleLine = true; textSize = 14f
+              }
+              fun EditText.onText(f: (String) -> Unit) = addTextChangedListener(object : TextWatcher {
+                  override fun afterTextChanged(s: Editable?) { f(s.toString()) }
+                  override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                  override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+              })
+              fun back(): View = hbox().apply {
+                  addView(badge("back", P.card, P.txt, 44, 20), lp(dp(44), dp(44)))
+                  addView(tv(t("Kembali|Back"), 14f, P.sub), lp(-2, -2).apply { leftMargin = dp(10) })
+                  setOnClickListener { sub = ""; show(-1) }
+              }
+              fun open(u: String) = startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)))
+              fun noAcc() = toast(t("Akses Shizuku/Root belum aktif|Shizuku/Root access not active"))
+              fun loading(msg: String) {
+                  ov?.let { rootL.removeView(it) }
+                  val f = FrameLayout(this).apply { setBackgroundColor(0x99000000.toInt()); isClickable = true; alpha = 0f }
+                  val card = vbox(P.card, 24, 28).apply { gravity = Gravity.CENTER_HORIZONTAL; elevation = dp(12).toFloat() }
+                  val spn = Spin(this).apply { col = P.acc; okC = c("#43A047"); errC = c("#E53935"); start() }
+                  card.addView(spn, lp(dp(64), dp(64)))
+                  val tx = tv(msg, 14f, P.txt, true).apply { gravity = Gravity.CENTER }
+                  card.addView(tx, lp(-2, -2).apply { topMargin = dp(14) })
+                  f.addView(card, FrameLayout.LayoutParams(dp(220), -2, Gravity.CENTER))
+                  rootL.addView(f, FrameLayout.LayoutParams(-1, -1))
+                  f.animate().alpha(1f).setDuration(160).start()
+                  card.scaleX = .9f; card.scaleY = .9f
+                  card.animate().scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(android.view.animation.OvershootInterpolator()).start()
+                  ov = f; ovSpin = spn; ovTxt = tx
+              }
+              fun done(ok: Boolean, msg: String) {
+                  val f = ov ?: return
+                  ovSpin?.finish(ok); ovTxt?.text = msg
+                  ui.postDelayed({ f.animate().alpha(0f).setDuration(220).withEndAction { rootL.removeView(f); if (ov === f) ov = null }.start() }, 900)
+              }
+              fun cmd(c: String, msg: String = "OK", after: (Boolean) -> Unit = {}) {
+                  if (!Sh.ok) { noAcc(); return }
+                  loading(t("Memproses...|Processing..."))
+                  ex.execute {
+                      val t0 = System.currentTimeMillis()
+                      val r = Sh.run(c)
+                      val ok = !r.startsWith("ERR") && !Regex("exception|denied|unknown command|not found|failed", RegexOption.IGNORE_CASE).containsMatchIn(r)
+                      val w = 800 - (System.currentTimeMillis() - t0)
+                      if (w > 0) Thread.sleep(w)
+                      ui.post { done(ok, if (ok) msg else r.lines().first().take(60)); after(ok) }
+                  }
+              }
+              fun mname(m: Int) = t(listOf("Hemat baterai|Battery saver", "Seimbang|Balanced", "Performa|Performance")[m])
+              fun chipset(): String =
+                  if (Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL.isNotBlank() && Build.SOC_MODEL != "unknown")
+                      Build.SOC_MODEL else Build.HARDWARE
+              fun isGame(ai: ApplicationInfo): Boolean {
+                  @Suppress("DEPRECATION") val f = (ai.flags and ApplicationInfo.FLAG_IS_GAME) != 0
+                  return f || ai.category == ApplicationInfo.CATEGORY_GAME
+              }
+              fun enSet(): MutableSet<String> = HashSet(sp.getStringSet("en", null) ?: emptySet())
+
+              // ---------- actions ----------
+              fun applyMode(m: Int) {
+                  if (!Sh.ok) { noAcc(); return }
+                  loading(t("Menerapkan mode...|Applying mode..."))
+                  ex.execute {
+                      val t0 = System.currentTimeMillis()
+                      Sh.run(when (m) {
+                          0 -> "settings put global low_power 1"
+                          1 -> "settings put global low_power 0; cmd power set-fixed-performance-mode-enabled false"
+                          else -> "settings put global low_power 0; cmd power set-fixed-performance-mode-enabled true"
+                      })
+                      if (Sh.root) {
+                          val g = when (m) { 0 -> "powersave"; 1 -> "schedutil"; else -> "performance" }
+                          val fb = if (m == 1) " || echo walt > \$c || echo interactive > \$c" else ""
+                          Sh.run("for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo $g > \$c$fb; done")
+                      }
+                      val gm = when (m) { 0 -> "battery"; 1 -> "standard"; else -> "performance" }
+                      enSet().forEach { Sh.run("cmd game mode $gm $it") }
+                      val w = 800 - (System.currentTimeMillis() - t0)
+                      if (w > 0) Thread.sleep(w)
+                      ui.post { done(true, mname(m)) }
+                  }
+              }
+              fun setMode(m: Int) { sp.edit().putInt("mode", m).apply(); applyMode(m) }
+              fun autoBoost(on: Boolean) {
+                  val js = getSystemService(JobScheduler::class.java)
+                  if (on) js.schedule(JobInfo.Builder(1, ComponentName(this, BoostJob::class.java)).setPeriodic(15 * 60 * 1000L).build())
+                  else js.cancel(1)
+                  sp.edit().putBoolean("auto", on).apply()
+              }
+              fun loadPhys(done: () -> Unit) {
+                  ex.execute {
+                      val o = Sh.run("wm size; wm density")
+                      val m = Regex("Physical size: (\\d+)x(\\d+)").find(o)
+                      val d = Regex("Physical density: (\\d+)").find(o)
+                      if (m != null && d != null) {
+                          pw = m.groupValues[1].toInt(); ph = m.groupValues[2].toInt(); pd = d.groupValues[1].toInt()
+                          sp.edit().putString("phys", "$pw,$ph,$pd").apply()
+                      } else sp.getString("phys", null)?.split(",")?.let { pw = it[0].toInt(); ph = it[1].toInt(); pd = it[2].toInt() }
+                      if (pw == 0) {
+                          val dm = DisplayMetrics()
+                          @Suppress("DEPRECATION") windowManager.defaultDisplay.getRealMetrics(dm)
+                          pw = minOf(dm.widthPixels, dm.heightPixels); ph = maxOf(dm.widthPixels, dm.heightPixels); pd = dm.densityDpi
+                      }
+                      ui.post { done() }
+                  }
+              }
+              fun applyRes(w: Int, h: Int) {
+                  if (!Sh.ok) { noAcc(); return }
+                  if (pw == 0) return
+                  val d = maxOf(72, pd * w / pw)
+                  cmd("wm size ${w}x$h; wm density $d", t("Resolusi diterapkan|Resolution applied")) { ok -> if (ok) ui.postDelayed({ confirmRevert() }, 1100) }
+              }
+              fun confirmRevert() {
+                  val rev = Runnable {
+                      ex.execute { Sh.run("wm size reset; wm density reset") }
+                      try { dlg?.dismiss() } catch (e: Exception) {}
+                  }
+                  dlg = AlertDialog.Builder(this).setMessage(t("Pertahankan pengaturan ini? Otomatis dikembalikan dalam 15 detik.|Keep this setting? It will revert automatically in 15 seconds."))
+                      .setPositiveButton(t("Simpan|Keep")) { _, _ -> ui.removeCallbacks(rev) }
+                      .setNegativeButton(t("Kembalikan|Revert")) { _, _ -> ui.removeCallbacks(rev); rev.run() }
+                      .setCancelable(false).create()
+                  dlg?.show()
+                  ui.postDelayed(rev, 15000)
+              }
+              fun resetRes() = cmd("wm size reset; wm density reset", t("Resolusi dikembalikan|Resolution restored"))
+
+              // ---------- navigation ----------
+              fun go(i: Int) {
+                  if (i < 0 || i > 3 || !Sh.ok || (i == tab && sub == "")) return
+                  val d = if (i >= tab) 1 else -1
+                  tab = i; sub = ""; show(d)
+              }
+              fun bounce(v: View) {
+                  v.animate().cancel()
+                  v.animate().scaleX(.86f).scaleY(.86f).setDuration(80).withEndAction {
+                      v.animate().scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(android.view.animation.OvershootInterpolator(3f)).start()
+                  }.start()
+              }
+              fun buildNav() {
+                  nav.removeAllViews(); navI.clear()
+                  navKeys.forEachIndexed { i, k ->
+                      val ic = Ico(this, k.first, P.txt)
+                      val lb = tv(t(k.second), 14f, P.onAcc, true).apply { visibility = View.GONE }
+                      val h = hbox().apply {
+                          gravity = Gravity.CENTER
+                          layoutTransition = android.animation.LayoutTransition()
+                          addView(ic, lp(dp(22), dp(22)))
+                          addView(lb, lp(-2, -2).apply { leftMargin = dp(8) })
+                          setOnClickListener { bounce(it); go(i) }
+                      }
+                      nav.addView(h, lp(-2, -2, 0f, 3))
+                      navI.add(Triple(h, ic, lb))
+                  }
+              }
+              fun updateNav() {
+                  navI.forEachIndexed { i, (h, ic, lb) ->
+                      val sel = i == tab
+                      lb.text = t(navKeys[i].second)
+                      lb.visibility = if (sel) View.VISIBLE else View.GONE
+                      if (sel) h.setPadding(dp(18), dp(12), dp(20), dp(12)) else h.setPadding(dp(13), dp(13), dp(13), dp(13))
+                      val from = (h.tag as? Int) ?: P.card
+                      val to = if (sel) P.acc else P.card
+                      if (from != to) {
+                          val an = android.animation.ValueAnimator.ofObject(android.animation.ArgbEvaluator(), from, to)
+                          an.duration = 260
+                          an.addUpdateListener { h.background = bg(it.animatedValue as Int, 40) }
+                          an.start()
+                      } else h.background = bg(to, 40)
+                      h.tag = to
+                      ic.tint(if (sel) P.onAcc else P.txt)
+                  }
+              }
+              fun shizAlive(): Boolean = try { Shizuku.pingBinder() } catch (e: Throwable) { false }
+              fun sig() = "${shizAlive()}${Sh.shizuku()}${Sh.root}$checking"
+              fun startPoll() {
+                  if (polling) return
+                  polling = true
+                  var last = sig()
+                  ui.postDelayed(object : Runnable {
+                      override fun run() {
+                          if (isFinishing || !gateShown) { polling = false; return }
+                          if (Sh.ok) { polling = false; show(); return }
+                          val sg = sig()
+                          if (sg != last) { last = sg; show() }
+                          ui.postDelayed(this, 1200)
+                      }
+                  }, 1200)
+              }
+              fun rootCheck() {
+                  checking = true; show()
+                  ex.execute { Sh.checkRoot(); checking = false; ui.post { show() } }
+              }
+              fun gate(): View = scroll {
+                  val alive = shizAlive()
+                  val perm = Sh.shizuku()
+                  val gc = c("#43A047"); val rc = c("#E53935")
+                  val hero = FrameLayout(this@MainActivity).apply {
+                      background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(c("#5B6CFF"), c("#9B5BFF"))).apply { shape = GradientDrawable.OVAL }
+                      elevation = dp(8).toFloat()
+                      addView(Ico(this@MainActivity, "lock", Color.WHITE), FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER))
+                  }
+                  addView(hero, lp(dp(96), dp(96)).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(30) })
+                  addView(tv(t("Akses diperlukan|Access required"), 26f, P.txt, true).apply { gravity = Gravity.CENTER }, lp().apply { topMargin = dp(20) })
+                  addView(tv(t("ZenithOptimizer membutuhkan akses Shizuku atau Root. Aktifkan salah satunya untuk membuka aplikasi.|ZenithOptimizer needs Shizuku or Root access. Enable one of them to open the app."), 13f, P.sub).apply { gravity = Gravity.CENTER }, lp().apply { topMargin = dp(8) })
+                  fun stRow(title: String, state: String, ok: Boolean): View = hbox().apply {
+                      background = bg(P.card, 18)
+                      setPadding(dp(12), dp(12), dp(14), dp(12))
+                      val col = if (ok) gc else rc
+                      addView(badge(if (ok) "check" else "cross", tint(col, 0x33), col), lp(dp(40), dp(40)))
+                      val tx = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                      tx.addView(tv(title, 14f, P.txt, true)); tx.addView(tv(state, 12f, col))
+                      addView(tx, lp(0, -2, 1f).apply { leftMargin = dp(12) })
+                  }
+                  if (checking) {
+                      val r = hbox().apply { background = bg(P.card, 18); setPadding(dp(14), dp(14), dp(14), dp(14)) }
+                      r.addView(Spin(this@MainActivity).apply { col = P.acc; start() }, lp(dp(28), dp(28)))
+                      r.addView(tv(t("Memeriksa akses...|Checking access..."), 14f, P.txt, true), lp(-2, -2).apply { leftMargin = dp(12) })
+                      addView(r, lp().apply { topMargin = dp(22) })
+                  } else {
+                      addView(stRow("Shizuku", if (perm) t("Aktif|Active") else if (alive) t("Berjalan, menunggu izin|Running, waiting for permission") else t("Tidak berjalan|Not running"), perm), lp().apply { topMargin = dp(22) })
+                      addView(stRow("Root", if (Sh.root) t("Aktif|Active") else t("Belum diberikan|Not granted"), Sh.root), lp().apply { topMargin = dp(8) })
+                  }
+                  put(actRow("lock", t("Izinkan Shizuku|Allow Shizuku"), t("Minta izin ke Shizuku yang berjalan|Request permission from running Shizuku")) {
+                      if (alive) { try { Shizuku.requestPermission(1) } catch (e: Throwable) { toast(e.message ?: "Error") } }
+                      else toast(t("Shizuku belum berjalan. Nyalakan dulu.|Shizuku is not running. Start it first."))
+                  })
+                  put(actRow("apps", t("Buka aplikasi Shizuku|Open Shizuku app"), "moe.shizuku.privileged.api") {
+                      val i = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+                      if (i != null) startActivity(i) else toast(t("Aplikasi Shizuku belum terpasang|Shizuku app is not installed"))
+                  })
+                  put(actRow("bolt", t("Cek akses root|Check root access"), t("Minta izin su|Request su permission")) { rootCheck() })
+                  put(actRow("undo", t("Periksa ulang|Re-check"), t("Segarkan status akses|Refresh access status"), true) { show() })
+              }
+              fun show(dir: Int = 0) {
+                  if (!Sh.ok) {
+                      gateShown = true
+                      nav.visibility = View.GONE
+                      host.removeAllViews(); host.addView(gate())
+                      startPoll()
+                      return
+                  }
+                  gateShown = false
+                  nav.visibility = View.VISIBLE
+                  updateNav()
+                  val v = when (sub) {
+                      "gfx" -> gfx()
+                      "ds" -> ds()
+                      else -> when (tab) { 0 -> home(); 1 -> apps(); 2 -> feat(); else -> settings() }
+                  }
+                  val old = if (host.childCount > 0) host.getChildAt(host.childCount - 1) else null
+                  if (dir == 0 || old == null) { host.removeAllViews(); host.addView(v); return }
+                  val w = (if (host.width > 0) host.width else dp(360)).toFloat() * 0.3f
+                  host.addView(v)
+                  v.translationX = dir * w; v.alpha = 0f
+                  v.animate().translationX(0f).alpha(1f).setDuration(280).setInterpolator(android.view.animation.DecelerateInterpolator(1.6f)).start()
+                  old.animate().translationX(-dir * w).alpha(0f).setDuration(200).withEndAction { host.removeView(old) }.start()
+              }
+
+              // ---------- HOME ----------
+              fun home(): View = scroll {
+                  val on = sp.getBoolean("on", false)
+                  val mode = sp.getInt("mode", 1)
+                  val hd = hbox()
+                  hd.addView(tv("ZenithOptimizer", 28f, P.txt, true), lp(0, -2, 1f))
+                  hd.addView(badge("power", if (on) P.acc else P.card, if (on) P.onAcc else P.txt, 44, 22).apply {
+                      setOnClickListener {
+                          val n = !sp.getBoolean("on", false)
+                          sp.edit().putBoolean("on", n).apply()
+                          applyMode(if (n) sp.getInt("mode", 1) else 1)
+                          show()
+                      }
+                  }, lp(dp(44), dp(44)))
+                  addView(hd)
+                  val ban = FrameLayout(this@MainActivity).apply { background = bg(P.inner, 24); clipToOutline = true }
+                  val iv = ImageView(this@MainActivity).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                  val f = File(filesDir, "banner.jpg")
+                  if (f.exists()) iv.setImageBitmap(BitmapFactory.decodeFile(f.path))
+                  else iv.setImageDrawable(GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(c("#3F51B5"), c("#7E57C2"), c("#26C6DA"))))
+                  ban.addView(iv, FrameLayout.LayoutParams(-1, -1))
+                  val st = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                  val running = on && Sh.ok
+                  st.addView(tv(if (running) t("Berjalan|Running") else t("Belum berjalan|Not running"), 14f, Color.WHITE, true).apply {
+                      setPadding(dp(14), dp(6), dp(14), dp(6)); background = bg(0xAA202020.toInt(), 50)
+                  })
+                  if (running) st.addView(tv("PID: " + android.os.Process.myPid(), 12f, Color.WHITE).apply {
+                      setPadding(dp(14), dp(4), dp(14), dp(4)); background = bg(0xAA202020.toInt(), 50)
+                  }, lp(-2, -2).apply { topMargin = dp(6) })
+                  ban.addView(st, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply { setMargins(dp(14), 0, 0, dp(14)) })
+                  ban.addView(tv(t("Ketuk untuk ganti foto|Tap to change photo"), 11f, Color.WHITE).apply {
+                      setPadding(dp(10), dp(4), dp(10), dp(4)); background = bg(0x88000000.toInt(), 50)
+                  }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply { setMargins(0, dp(10), dp(10), 0) })
+                  ban.setOnClickListener {
+                      startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { type = "image/*"; addCategory(Intent.CATEGORY_OPENABLE) }, 7)
+                  }
+                  addView(ban, lp(-1, dp(200)).apply { topMargin = dp(12) })
+
+                  fun tile(col: Int, sym: String, symC: Int, title: String, s2: String, s2c: Int, go: () -> Unit): View = vbox(P.card, 10, 24).apply {
+                      addView(FrameLayout(this@MainActivity).apply {
+                          background = bg(col, 18)
+                          addView(Ico(this@MainActivity, sym, symC), FrameLayout.LayoutParams(dp(42), dp(42), Gravity.CENTER))
+                      }, lp(-1, dp(90)))
+                      addView(tv(title, 15f, P.txt, true), lp().apply { topMargin = dp(10) })
+                      addView(tv(s2, 12f, s2c))
+                      setOnClickListener { go() }
+                  }
+                  val row = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
+                  row.addView(tile(c("#4A5A8A"), listOf("battery", "gauge", "bolt")[mode], Color.WHITE, t("Profil saat ini|Current profile"), mname(mode), P.sub) {
+                      AlertDialog.Builder(this@MainActivity).setTitle(t("Pilih profil|Choose profile"))
+                          .setItems(arrayOf(mname(0), mname(1), mname(2))) { _, w -> setMode(w); show() }.show()
+                  }, lp(0, -2, 1f, 4))
+                  val ok = Sh.ok
+                  val via = if (Sh.root) "Root" else "Shizuku"
+                  row.addView(tile(if (ok) c("#1B5E20") else c("#7F1D1D"), if (ok) "check" else "cross", if (ok) c("#A5D6A7") else c("#FF8A80"),
+                      t("Akses Shizuku/Root|Shizuku/Root access"),
+                      if (ok) "$via • " + t("Diperoleh|Granted") else t("Belum aktif|Not active"),
+                      if (ok) c("#66BB6A") else c("#EF5350")) {
+                      if (!Sh.ok) {
+                          try {
+                              if (Shizuku.pingBinder()) Shizuku.requestPermission(1)
+                              else toast(t("Nyalakan Shizuku atau berikan akses root|Start Shizuku or grant root"))
+                          } catch (e: Throwable) { toast(t("Nyalakan Shizuku atau berikan akses root|Start Shizuku or grant root")) }
+                      }
+                  }, lp(0, -2, 1f, 4))
+                  put(row)
+
+                  val info = vbox(P.card, 14, 24)
+                  val ih = hbox()
+                  ih.addView(badge("info", P.inner, P.acc, 40, 20), lp(dp(40), dp(40)))
+                  ih.addView(tv(t("Info perangkat|Device info"), 17f), lp(-2, -2).apply { leftMargin = dp(12) })
+                  info.addView(ih)
+                  val bi = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  val lvl = bi?.getIntExtra("level", 0) ?: 0
+                  val tmp = (bi?.getIntExtra("temperature", 0) ?: 0) / 10.0
+                  fun box(l: String, v: String) = vbox(P.inner, 12, 16).apply { addView(tv(l, 12f, P.sub)); addView(tv(v, 14f, P.txt, true)) }
+                  val r1 = LinearLayout(this@MainActivity); val r2 = LinearLayout(this@MainActivity)
+                  r1.addView(box(t("Nama perangkat|Device name"), Build.MANUFACTURER.replaceFirstChar { it.uppercase() } + " " + Build.MODEL), lp(0, -2, 1f, 4))
+                  r1.addView(box(t("Versi Android|Android version"), "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"), lp(0, -2, 1f, 4))
+                  r2.addView(box("Chipset", chipset()), lp(0, -2, 1f, 4))
+                  r2.addView(box(t("Suhu & baterai|Temp & battery"), "$tmp°C • $lvl%"), lp(0, -2, 1f, 4))
+                  info.addView(r1, lp().apply { topMargin = dp(10) })
+                  info.addView(r2)
+                  put(info)
+              }
+
+              // ---------- APPS ----------
+              fun apps(): View {
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(48), dp(16), 0) }
+                  col.addView(tv(t("Daftar aplikasi|App list"), 28f, P.txt, true))
+                  val et = edit(t("Cari aplikasi...|Search apps..."))
+                  col.addView(et, lp().apply { topMargin = dp(10); bottomMargin = dp(10) })
+                  val lv = ListView(this).apply { divider = null; setPadding(0, 0, 0, dp(110)); clipToPadding = false }
+                  col.addView(lv, lp(-1, 0, 1f))
+                  var all = listOf<AppI>()
+                  var shown = listOf<AppI>()
+                  val green = c("#4CAF50"); val red = c("#EF5350"); val blue = c("#7986CB")
+                  val ad = object : BaseAdapter() {
+                      override fun getCount() = shown.size
+                      override fun getItem(i: Int) = shown[i]
+                      override fun getItemId(i: Int) = i.toLong()
+                      override fun getView(i: Int, cv: View?, p: ViewGroup?): View {
+                          val a = shown[i]
+                          val en = enSet().contains(a.pkg)
+                          val r = hbox().apply { background = bg(P.card, 16); setPadding(dp(14), dp(12), dp(14), dp(12)) }
+                          val ic = ImageView(this@MainActivity)
+                          var d = icons.get(a.pkg)
+                          if (d == null) { d = try { packageManager.getApplicationIcon(a.pkg) } catch (e: Exception) { null }; if (d != null) icons.put(a.pkg, d) }
+                          ic.setImageDrawable(d)
+                          r.addView(ic, lp(dp(46), dp(46)))
+                          val tx = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                          tx.addView(tv(a.label, 16f, P.txt, true).apply { isSingleLine = true })
+                          tx.addView(tv(a.pkg, 12f, P.sub).apply { isSingleLine = true })
+                          val cr = hbox()
+                          cr.addView(chip(if (en) t("Diaktifkan|Enabled") else t("Dinonaktifkan|Disabled"), if (en) green else red), lp(-2, -2).apply { rightMargin = dp(8) })
+                          if (a.game) cr.addView(chip(t("Direkomendasikan|Recommended"), blue))
+                          tx.addView(cr, lp().apply { topMargin = dp(6) })
+                          r.addView(tx, lp(0, -2, 1f).apply { leftMargin = dp(14) })
+                          r.setOnClickListener {
+                              val s = enSet(); if (!s.add(a.pkg)) s.remove(a.pkg)
+                              sp.edit().putStringSet("en", s).apply(); notifyDataSetChanged()
+                          }
+                          return LinearLayout(this@MainActivity).apply { setPadding(0, 0, 0, dp(6)); addView(r, lp()) }
+                      }
+                  }
+                  lv.adapter = ad
+                  et.onText { q ->
+                      shown = all.filter { it.label.contains(q, true) || it.pkg.contains(q, true) }
+                      ad.notifyDataSetChanged()
+                  }
+                  Thread {
+                      val pm = packageManager
+                      val l = pm.getInstalledApplications(0).map { AppI(it.loadLabel(pm).toString(), it.packageName, isGame(it)) }
+                          .filter { it.pkg != packageName }
+                          .sortedWith(compareByDescending<AppI> { it.game }.thenBy { it.label.lowercase() })
+                      if (!sp.contains("en")) sp.edit().putStringSet("en", l.filter { it.game }.map { it.pkg }.toHashSet()).apply()
+                      ui.post { all = l; shown = l; ad.notifyDataSetChanged() }
+                  }.start()
+                  return col
+              }
+
+              // ---------- FEATURES ----------
+              fun feat(): View = scroll {
+                  addView(tv(t("Fitur|Features"), 28f, P.txt, true))
+                  put(sec(t("Pilih fitur|Choose feature")))
+                  val sr = LinearLayout(this@MainActivity)
+                  sr.addView(gradTile("pad", t("Grafik PC/MC|PC/MC Graphics"), "ANGLE · Smooth · Pixel", "#5B6CFF", "#9B5BFF") { sub = "gfx"; angle = 0; show(1) }, lp(0, -2, 1f, 4))
+                  sr.addView(gradTile("scale", "Downscale", "0.1 – 0.9 · DPI auto", "#00B8A9", "#2D7DFF") { sub = "ds"; show(1) }, lp(0, -2, 1f, 4))
+                  addView(sr)
+
+                  val mode = sp.getInt("mode", 1)
+                  val mb = LinearLayout(this@MainActivity)
+                  for (m in 0..2) mb.addView(btn(mname(m), m == mode) { setMode(m); show() }, lp(0, -2, 1f, 3))
+                  put(cardI("gauge", t("Mode|Mode"), mb))
+
+                  @Suppress("DEPRECATION")
+                  val rates = windowManager.defaultDisplay.supportedModes.map { Math.round(it.refreshRate) }.distinct().sorted()
+                  val rv = rates.map { r -> btn("$r Hz") { cmd("settings put system min_refresh_rate $r; settings put system peak_refresh_rate $r", "$r Hz") } }.toMutableList()
+                  rv.add(btn("Auto") { cmd("settings delete system min_refresh_rate; settings delete system peak_refresh_rate", "Auto") })
+                  put(cardI("screen", t("Kunci layar Hz|Lock refresh rate"), hs(*rv.toTypedArray())))
+
+                  put(cardI("dnd", t("Jangan ganggu|Do not disturb"),
+                      swCard("dnd", t("Mode jangan ganggu|Do not disturb mode"), t("Bungkam notifikasi saat bermain|Silence notifications while gaming"), sp.getBoolean("dnd", false)) { v ->
+                          cmd("cmd notification set_dnd " + if (v) "priority" else "off", "DND " + if (v) "ON" else "OFF") { ok -> if (ok) sp.edit().putBoolean("dnd", v).apply() else show() }
+                      }))
+
+                  fun anim(v: String) = "settings put global window_animation_scale $v; settings put global transition_animation_scale $v; settings put global animator_duration_scale $v"
+                  put(cardI("play", t("Skala animasi|Animation scale"), hs(
+                      btn(t("Mati|Off")) { cmd(anim("0")) }, btn("0.5x") { cmd(anim("0.5")) }, btn("1x") { cmd(anim("1")) })))
+
+                  put(cardI("bolt", t("Hapus cache & boost|Clear cache & boost"),
+                      actRow("trash", t("Hapus cache semua aplikasi|Clear all app cache"), t("Bersihkan cache seluruh aplikasi|Free the cache of every app")) { cmd("pm trim-caches 999G", t("Cache dihapus|Cache cleared")) },
+                      actRow("bolt", t("Boost manual|Manual boost"), t("Bebaskan RAM sekarang|Free up RAM now")) { cmd(BOOST, "Boost OK") },
+                      swCard("clock", t("Boost otomatis|Auto boost"), t("Berjalan tiap 15 menit|Runs every 15 minutes"), sp.getBoolean("auto", false)) { autoBoost(it) }))
+
+                  val pct = tv("${sp.getInt("br", 50)}%", 14f, P.acc, true)
+                  val sb = SeekBar(this@MainActivity).apply {
+                      max = 17; progress = (sp.getInt("br", 50) - 15) / 5
+                      progressTintList = android.content.res.ColorStateList.valueOf(P.acc)
+                      thumbTintList = android.content.res.ColorStateList.valueOf(P.acc)
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { pct.text = "${p * 5 + 15}%" }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {
+                              val v = progress * 5 + 15
+                              sp.edit().putInt("br", v).apply()
+                              cmd("settings put system screen_brightness_mode 0; settings put system screen_brightness ${v * 255 / 100}", "$v%")
+                          }
+                      })
+                  }
+                  put(cardI("sun", t("Kecerahan (15% - 100%)|Brightness (15% - 100%)"), pct, sb))
+
+                  val pr = LinearLayout(this@MainActivity)
+                  pr.addView(toggleTile("battery", t("Hemat daya|Battery saver"), "lp") { v, cb ->
+                      cmd("settings put global low_power ${if (v) 1 else 0}", "Hemat daya " + if (v) "ON" else "OFF", cb)
+                  }, lp(0, -2, 1f, 4))
+                  pr.addView(toggleTile("clock", "Doze Mode", "doze") { v, cb ->
+                      cmd(if (v) "dumpsys deviceidle force-idle" else "dumpsys deviceidle unforce", "Doze " + if (v) "ON" else "OFF", cb)
+                  }, lp(0, -2, 1f, 4))
+                  put(cardI("battery", t("Mode hemat daya|Power saving"), pr))
+
+                  val rec = tv("...", 13f, P.sub)
+                  val ew = edit(t("Lebar|Width")).apply { inputType = InputType.TYPE_CLASS_NUMBER }
+                  val eh = edit(t("Tinggi|Height")).apply { inputType = InputType.TYPE_CLASS_NUMBER }
+                  var rw = 0; var rh = 0
+                  loadPhys {
+                      val mi = ActivityManager.MemoryInfo()
+                      (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
+                      val gb = mi.totalMem / 1e9
+                      val f = when { gb <= 3 -> 0.7; gb <= 4 -> 0.75; gb <= 6 -> 0.8; gb <= 8 -> 0.85; else -> 0.9 }
+                      rw = (pw * f).toInt() / 2 * 2; rh = (ph * f).toInt() / 2 * 2
+                      rec.text = "${t("Asli|Native")}: ${pw}x$ph • DPI $pd\n${t("Rekomendasi AI|AI recommendation")}: ${rw}x$rh (${(f * 100).toInt()}%) • RAM ${"%.1f".format(gb)} GB • ${chipset()}"
+                  }
+                  val er = LinearLayout(this@MainActivity)
+                  er.addView(ew, lp(0, -2, 1f, 4)); er.addView(eh, lp(0, -2, 1f, 4))
+                  val br = LinearLayout(this@MainActivity)
+                  br.addView(btn(t("Terapkan|Apply"), true) {
+                      val w = ew.text.toString().toIntOrNull(); val h = eh.text.toString().toIntOrNull()
+                      if (w == null || h == null || w < 200 || h < 200) toast(t("Isi resolusi yang valid|Enter a valid resolution")) else applyRes(w, h)
+                  }, lp(0, -2, 1f, 4))
+                  br.addView(btn("Reset") { resetRes() }, lp(0, -2, 1f, 4))
+                  put(cardI("scale", t("Resolusi custom|Custom resolution"), rec,
+                      actRow("bolt", t("Pakai rekomendasi AI|Use AI recommendation"), t("Isi otomatis sesuai perangkat|Auto-fill for this device")) { if (rw > 0) { ew.setText("$rw"); eh.setText("$rh") } },
+                      er, br))
+              }
+
+              // ---------- GRAPHICS ----------
+              fun gfx(): View = scroll {
+                  addView(back())
+                  addView(tv(t("Grafik PC/MC|PC/MC Graphics"), 28f, P.txt, true), lp().apply { topMargin = dp(16) })
+                  addView(tv(t("Atur render ANGLE untuk game target.|Tune ANGLE rendering for the target game."), 13f, P.sub))
+                  if (angle == 0 && !angleBusy) {
+                      angleBusy = true
+                      ex.execute {
+                          val t0 = System.currentTimeMillis()
+                          val r = Sh.run("ls -d /system/*/*angle* /vendor/*/*angle* 2>/dev/null")
+                          val w = 1200 - (System.currentTimeMillis() - t0)
+                          if (w > 0) Thread.sleep(w)
+                          ui.post { angleInfo = r; angle = if (r.isNotBlank() && !r.startsWith("ERR")) 1 else 2; angleBusy = false; if (sub == "gfx") show() }
+                      }
+                  }
+                  val gc = c("#43A047"); val rc = c("#E53935")
+                  val locked = angle != 1
+                  val stc = vbox(P.card, 16, 24)
+                  val sr = hbox()
+                  val holder = FrameLayout(this@MainActivity)
+                  if (angle == 0) holder.addView(Spin(this@MainActivity).apply { col = P.acc; start() }, FrameLayout.LayoutParams(dp(40), dp(40), Gravity.CENTER))
+                  else {
+                      val sc = if (angle == 1) gc else rc
+                      holder.background = bg(tint(sc, 0x33), 24)
+                      holder.addView(Ico(this@MainActivity, if (angle == 1) "check" else "cross", sc), FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER))
+                  }
+                  sr.addView(holder, lp(dp(48), dp(48)))
+                  val tx = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                  tx.addView(tv(t("Dukungan ANGLE|ANGLE support"), 13f, P.sub))
+                  tx.addView(tv(when (angle) { 0 -> t("Memeriksa...|Checking..."); 1 -> t("Support|Supported"); else -> t("Tidak support|Not supported") }, 18f, when (angle) { 0 -> P.txt; 1 -> gc; else -> rc }, true))
+                  sr.addView(tx, lp(0, -2, 1f).apply { leftMargin = dp(14) })
+                  if (angle != 0) {
+                      val sc = if (angle == 1) gc else rc
+                      sr.addView(tv(if (angle == 1) "SUPPORT" else t("TIDAK SUPPORT|UNSUPPORTED"), 11f, sc, true).apply {
+                          setPadding(dp(10), dp(4), dp(10), dp(4)); background = bg(tint(sc, 0x2A), 50)
+                      })
+                  }
+                  stc.addView(sr)
+                  if (angle == 1) stc.addView(tv(angleInfo.lines().first().take(70), 11f, P.sub).apply { typeface = Typeface.MONOSPACE }, lp().apply { topMargin = dp(10) })
+                  if (angle == 2) stc.addView(tv(t("Fitur dikunci karena perangkat ini tidak mendukung ANGLE.|Feature locked because this device does not support ANGLE."), 12f, rc), lp().apply { topMargin = dp(10) })
+                  put(stc)
+
+                  fun lockable(v: View): View {
+                      if (locked) {
+                          v.alpha = 0.4f
+                          v.setOnClickListener { toast(if (angle == 0) t("Sedang memeriksa ANGLE...|Checking ANGLE...") else t("Fitur terkunci: ANGLE tidak didukung|Locked: ANGLE not supported")) }
+                      }
+                      return v
+                  }
+                  val pk = edit("package").apply { setText(sp.getString("tgt", "com.dts.freefiremax")); isEnabled = !locked; alpha = if (locked) 0.4f else 1f }
+                  put(cardI("pad", t("Game target|Target game"), pk))
+                  val cur = sp.getString("gfxm", "") ?: ""
+                  fun doGfx(kind: String, extra: String) {
+                      val p = pk.text.toString().trim()
+                      if (p.isEmpty()) { toast("package?"); return }
+                      cmd("settings put global angle_gl_driver_selection_pkgs $p && settings put global angle_gl_driver_selection_values angle && setprop debug.angle.feature_overrides_enabled $extra && am force-stop $p", kind) { ok ->
+                          if (ok) { sp.edit().putString("tgt", p).putString("gfxm", kind).apply(); show() }
+                      }
+                  }
+                  val hh = hbox()
+                  hh.addView(sec(t("Mode grafik|Graphics mode")))
+                  if (locked) hh.addView(Ico(this@MainActivity, "lock", rc), lp(dp(15), dp(15)).apply { leftMargin = dp(8) })
+                  put(hh)
+                  put(lockable(actRow("wave", "Smooth Graphics", t("Tekstur halus, anisotropic off, LOD +4|Smooth textures, anisotropic off, LOD +4"), cur == "smooth") {
+                      doGfx("smooth", "disableAnisotropicFiltering:forceTextureLodOffset4")
+                  }))
+                  put(lockable(actRow("apps", "Pixel Graphics", t("Filter nearest bergaya pixel|Nearest filtering, pixel style"), cur == "pixel") {
+                      doGfx("pixel", "forceNearestFiltering:disableAnisotropicFiltering:forceTextureLodOffset4")
+                  }))
+                  put(lockable(actRow("undo", "Restore Default", t("Kembalikan ke pengaturan bawaan|Back to default settings")) {
+                      val p = pk.text.toString().trim()
+                      cmd("settings delete global angle_gl_driver_selection_values && settings delete global angle_gl_driver_selection_pkgs && setprop debug.angle.feature_overrides_enabled \"\" && am force-stop $p", "Default") { ok ->
+                          if (ok) { sp.edit().putString("gfxm", "").apply(); show() }
+                      }
+                  }))
+                  put(actRow("check", t("Periksa ulang ANGLE|Re-check ANGLE"), t("Jalankan ulang pengecekan dukungan|Run the support check again")) { angle = 0; show() })
+              }
+
+              // ---------- DOWNSCALE ----------
+              fun ds(): View = scroll {
+                  addView(back())
+                  addView(tv("Downscale", 28f, P.txt, true), lp().apply { topMargin = dp(16) })
+                  addView(tv(t("Turunkan resolusi layar untuk FPS lebih stabil. DPI ikut menyesuaikan otomatis.|Lower the screen resolution for steadier FPS. DPI follows automatically."), 13f, P.sub))
+                  var selN = sp.getInt("dsn", 8)
+                  val mi = ActivityManager.MemoryInfo()
+                  (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
+                  val gbm = mi.totalMem / 1e9
+                  val recN = Math.round((when { gbm <= 3 -> 0.7; gbm <= 4 -> 0.75; gbm <= 6 -> 0.8; gbm <= 8 -> 0.85; else -> 0.9 }) * 10).toInt().coerceIn(1, 9)
+                  val white = 0xCCFFFFFF.toInt()
+                  val hero = vbox(P.card, 20, 28).apply {
+                      background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(c("#00B8A9"), c("#2D7DFF"))).apply { cornerRadius = dp(28).toFloat() }
+                      elevation = dp(6).toFloat()
+                  }
+                  val hTop = hbox()
+                  hTop.addView(tv(t("Resolusi hasil|Result resolution"), 13f, white), lp(0, -2, 1f))
+                  hTop.addView(badge("scale", 0x33FFFFFF, Color.WHITE, 38, 20), lp(dp(38), dp(38)))
+                  val big = tv("...", 34f, Color.WHITE, true)
+                  val small = tv("", 13f, white)
+                  hero.addView(hTop)
+                  hero.addView(big, lp().apply { topMargin = dp(10) })
+                  hero.addView(small, lp().apply { topMargin = dp(4) })
+                  put(hero)
+                  val boxes = ArrayList<LinearLayout>(); val mains = ArrayList<TextView>(); val subs = ArrayList<TextView>(); val ais = ArrayList<TextView>()
+                  val warn = tv("", 12f, c("#E53935"))
+                  fun resFor(n: Int): Triple<Int, Int, Int> {
+                      val w = (pw * n / 10) / 2 * 2; val h = (ph * n / 10) / 2 * 2
+                      return Triple(w, h, maxOf(72, if (pw > 0) pd * w / pw else 0))
+                  }
+                  fun refresh() {
+                      if (pw == 0) { big.text = "..."; small.text = ""; return }
+                      val (w, h, d) = resFor(selN)
+                      big.text = "$w × $h"
+                      small.text = "DPI $d · ${t("skala|scale")} 0.$selN×\n${t("Asli|Native")}: $pw × $ph · DPI $pd"
+                      warn.text = if (selN <= 3) t("Skala sangat kecil, layar sulit dibaca. Otomatis kembali jika tidak disimpan.|Very small scale, the screen is hard to read. Reverts automatically if not kept.") else ""
+                  }
+                  fun paintAll() {
+                      for (k in 0 until 9) {
+                          val sel = (k + 1) == selN
+                          boxes[k].background = bg(if (sel) P.acc else P.inner, 18)
+                          mains[k].setTextColor(if (sel) P.onAcc else P.txt)
+                          subs[k].setTextColor(if (sel) P.onAcc else P.sub)
+                          ais[k].setTextColor(if (sel) P.onAcc else P.acc)
+                      }
+                  }
+                  val rows = ArrayList<View>()
+                  for (r in 0..2) {
+                      val row = LinearLayout(this@MainActivity)
+                      for (j in 1..3) {
+                          val n = r * 3 + j
+                          val box = vbox(P.inner, 12, 18)
+                          val a = tv("0.$n", 22f, P.txt, true)
+                          val b = tv(" ", 11f, P.sub)
+                          val ai = chip("AI", P.acc).apply { visibility = if (n == recN) View.VISIBLE else View.INVISIBLE }
+                          box.addView(a); box.addView(b); box.addView(ai, lp(-2, -2).apply { topMargin = dp(6) })
+                          box.setOnClickListener { bounce(box); selN = n; paintAll(); refresh() }
+                          boxes.add(box); mains.add(a); subs.add(b); ais.add(ai)
+                          row.addView(box, lp(0, -2, 1f, 4))
+                      }
+                      rows.add(row)
+                  }
+                  put(cardI("scale", t("Pilih skala|Choose scale"), *rows.toTypedArray()))
+                  addView(warn, lp().apply { topMargin = dp(8) })
+                  paintAll()
+                  loadPhys {
+                      for (k in 0 until 9) { val (w, h, _) = resFor(k + 1); subs[k].text = "$w×$h" }
+                      refresh(); paintAll()
+                  }
+                  put(actRow("play", t("Terapkan skala|Apply scale"), t("Resolusi dan DPI diubah sekaligus|Resolution and DPI change together"), true) {
+                      if (pw > 0) { val (w, h, _) = resFor(selN); sp.edit().putInt("dsn", selN).apply(); applyRes(w, h) }
+                  })
+                  put(actRow("undo", "Reset", t("Kembali ke resolusi asli|Back to native resolution")) { resetRes() })
+                  put(cardI("info", t("Tentang DPI otomatis|About auto DPI"),
+                      tv(t("DPI dihitung dari skala yang dipilih supaya tampilan tetap proporsional. Setelah diterapkan, pilih Simpan dalam 15 detik atau pengaturan dikembalikan otomatis.|DPI is derived from the chosen scale to keep the layout proportional. After applying, choose Keep within 15 seconds or it reverts automatically."), 13f, P.sub)))
+              }
+
+              // ---------- SETTINGS ----------
+              fun settings(): View = scroll {
+                  addView(tv(t("Pengaturan|Settings"), 28f, P.txt, true))
+                  val th = sp.getString("theme", "system")
+                  fun thBtn(k: String, l: String) = btn(l, th == k) {
+                      sp.edit().putString("theme", k).putInt("rt", 3).apply(); recreate()
+                  }
+                  put(cardI("sun", t("Tema warna|Color theme"), hs(thBtn("system", t("Sistem|System")), thBtn("light", "Light"), thBtn("dark", "Dark"))))
+                  put(cardI("globe", t("Bahasa|Language"), hs(
+                      btn("Indonesia", lang == "id") { lang = "id"; sp.edit().putString("lang", "id").apply(); show() },
+                      btn("English", lang == "en") { lang = "en"; sp.edit().putString("lang", "en").apply(); show() })))
+                  put(cardI("share", t("Sosial media|Social media"),
+                      actRow("share", "TikTok", "@lutfikreji") { open("https://www.tiktok.com/@lutfikreji") },
+                      actRow("share", t("Saluran WhatsApp|WhatsApp channel"), "WhatsApp") { open("https://whatsapp.com/channel/0029Vb8BjUO6WaKsAOUqWK0I") }))
+                  put(cardI("info", t("Tentang|About"),
+                      tv(t("Developer|Developer") + ": lutfikreji", 14f, P.sub),
+                      tv(t("Versi aplikasi|App version") + ": 1.0.0", 14f, P.sub)))
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        working-directory: zo
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: cp zo/app/build/outputs/apk/debug/app-debug.apk ZenithOptimizer-1.0.0.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZenithOptimizer
+          path: ZenithOptimizer-1.0.0.apk
